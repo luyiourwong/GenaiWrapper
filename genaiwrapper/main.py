@@ -51,7 +51,7 @@ async def chat_completions(request: Request) -> Response:
         # 記錄請求資訊：模型名稱與輸入長度
         model = body.get("model", "unknown")
         messages = body.get("messages", [])
-        input_chars = sum(len(msg.get("content", "")) for msg in messages)
+        input_chars = sum(len(msg.get("content") or "") for msg in messages)
         logger.info(f"呼叫模型: {model}, 訊息數: {len(messages)}, 輸入字元數: {input_chars}")
 
         # 判斷是否為 streaming 請求
