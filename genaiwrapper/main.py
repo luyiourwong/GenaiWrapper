@@ -1,6 +1,7 @@
 """主要轉發器模組，提供 OpenAI 相容的 API 端點"""
 
 import logging
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
@@ -9,6 +10,7 @@ from fastapi.responses import StreamingResponse
 
 from genaiwrapper.auth import token_provider
 from genaiwrapper.config import settings
+from genaiwrapper.stats import stats_manager
 
 # 設定日誌
 logging.basicConfig(
@@ -17,12 +19,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> Any:
+    """應用生命週期管理"""
+    # Startup
+    logger.info("GenaiWrapper 服務啟動")
+    yield
+    # Shutdown
+    stats_manager.print_summary()
+
+
 # 建立 FastAPI 應用
 app = FastAPI(
     title="GenaiWrapper",
     description="本地轉發器，將 OpenAI 相容請求轉發到 GCP Vertex AI",
     version="0.1.0",
+    lifespan=lifespan,
 )
+
 
 # 建立目標 URL
 TARGET_URL = f"https://{settings.endpoint}/v1/projects/{settings.project_id}/locations/{settings.region}/endpoints/openapi/chat/completions"
@@ -72,33 +87,45 @@ async def chat_completions(request: Request) -> Response:
 
         if stream:
             # Streaming 模式：透傳 SSE 回應
-            return await _handle_streaming_request(body, headers)
+            return await _handle_streaming_request(body, headers, model, len(messages), input_chars)
         else:
             # 非 Streaming 模式：直接回傳 JSON
-            return await _handle_normal_request(body, headers)
+            return await _handle_normal_request(body, headers, model, len(messages), input_chars)
 
     except Exception as e:
         logger.error(f"處理請求時發生錯誤: {e}", exc_info=True)
         raise
 
 
-async def _handle_streaming_request(body: dict[str, Any], headers: dict[str, str]) -> StreamingResponse:
+async def _handle_streaming_request(
+    body: dict[str, Any],
+    headers: dict[str, str],
+    model: str,
+    message_count: int,
+    input_chars: int,
+) -> StreamingResponse:
     """處理 streaming 請求，透傳 SSE 回應"""
 
     async def stream_generator() -> Any:
         """SSE 串流生成器"""
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            async with client.stream(
-                "POST",
-                TARGET_URL,
-                json=body,
-                headers=headers,
-            ) as response:
-                response.raise_for_status()
+        try:
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                async with client.stream(
+                    "POST",
+                    TARGET_URL,
+                    json=body,
+                    headers=headers,
+                ) as response:
+                    response.raise_for_status()
 
-                # 透傳 SSE 事件
-                async for chunk in response.aiter_bytes():
-                    yield chunk
+                    # 透傳 SSE 事件
+                    async for chunk in response.aiter_bytes():
+                        yield chunk
+            # Streaming 完成後記錄統計
+            stats_manager.record_request(model, message_count, input_chars, is_streaming=True)
+        except Exception:
+            # 發生錯誤時不記錄統計
+            raise
 
     # 回傳 StreamingResponse，保持 SSE 格式
     return StreamingResponse(
@@ -112,7 +139,13 @@ async def _handle_streaming_request(body: dict[str, Any], headers: dict[str, str
     )
 
 
-async def _handle_normal_request(body: dict[str, Any], headers: dict[str, str]) -> Response:
+async def _handle_normal_request(
+    body: dict[str, Any],
+    headers: dict[str, str],
+    model: str,
+    message_count: int,
+    input_chars: int,
+) -> Response:
     """處理非 streaming 請求，直接回傳 JSON"""
 
     async with httpx.AsyncClient(timeout=300.0) as client:
@@ -122,6 +155,9 @@ async def _handle_normal_request(body: dict[str, Any], headers: dict[str, str]) 
             headers=headers,
         )
         response.raise_for_status()
+
+    # 記錄統計
+    stats_manager.record_request(model, message_count, input_chars, is_streaming=False)
 
     return Response(
         content=response.content,
