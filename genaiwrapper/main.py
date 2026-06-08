@@ -1,16 +1,18 @@
 """主要轉發器模組，提供 OpenAI 相容的 API 端點"""
 
+import json
 import logging
 from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
+import uvicorn
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 
 from genaiwrapper.auth import token_provider
 from genaiwrapper.config import settings
-from genaiwrapper.stats import stats_manager
+from genaiwrapper.stats import UsageInfo, stats_manager
 
 # 設定日誌
 logging.basicConfig(
@@ -18,6 +20,35 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _extract_usage_metadata(response_data: dict[str, Any]) -> UsageInfo:
+    """從 API 回應中提取 token 使用資訊 (OpenAI 相容格式)"""
+    usage = response_data.get("usage", {})
+    prompt_tokens_details = usage.get("prompt_tokens_details", {}) or {}
+    return UsageInfo(
+        prompt_tokens=usage.get("prompt_tokens", 0) or 0,
+        completion_tokens=usage.get("completion_tokens", 0) or 0,
+        cached_tokens=prompt_tokens_details.get("cached_tokens", 0) or 0,
+        total_tokens=usage.get("total_tokens", 0) or 0,
+    )
+
+
+def _extract_usage_from_sse(sse_chunk: str) -> UsageInfo:
+    """從 SSE 事件中提取 token 使用資訊"""
+    last_usage = UsageInfo()
+
+    # SSE 格式: "data: {...}"，一個 chunk 可能包含多行，取最後一個有 usage 的
+    for line in sse_chunk.split("\n"):
+        if line.startswith("data: "):
+            try:
+                data = json.loads(line[6:])  # 移除 "data: " 前綴
+                candidate = _extract_usage_metadata(data)
+                if candidate.total_tokens > 0:
+                    last_usage = candidate
+            except json.JSONDecodeError:
+                continue
+    return last_usage
 
 
 @asynccontextmanager
@@ -63,11 +94,10 @@ async def chat_completions(request: Request) -> Response:
         # 取得請求 body
         body = await request.json()
 
-        # 記錄請求資訊：模型名稱與輸入長度
+        # 記錄請求資訊：模型名稱與訊息數
         model = body.get("model", "unknown")
         messages = body.get("messages", [])
-        input_chars = sum(len(msg.get("content") or "") for msg in messages)
-        logger.info(f"呼叫模型: {model}, 訊息數: {len(messages)}, 輸入字元數: {input_chars}")
+        logger.info(f"呼叫模型: {model}, 訊息數: {len(messages)}")
 
         # 判斷是否為 streaming 請求
         stream = body.get("stream", False)
@@ -87,10 +117,10 @@ async def chat_completions(request: Request) -> Response:
 
         if stream:
             # Streaming 模式：透傳 SSE 回應
-            return await _handle_streaming_request(body, headers, model, len(messages), input_chars)
+            return await _handle_streaming_request(body, headers, model, len(messages))
         else:
             # 非 Streaming 模式：直接回傳 JSON
-            return await _handle_normal_request(body, headers, model, len(messages), input_chars)
+            return await _handle_normal_request(body, headers, model, len(messages))
 
     except Exception as e:
         logger.error(f"處理請求時發生錯誤: {e}", exc_info=True)
@@ -102,12 +132,13 @@ async def _handle_streaming_request(
     headers: dict[str, str],
     model: str,
     message_count: int,
-    input_chars: int,
 ) -> StreamingResponse:
     """處理 streaming 請求，透傳 SSE 回應"""
 
     async def stream_generator() -> Any:
         """SSE 串流生成器"""
+        usage = UsageInfo()
+        buffer = ""
         try:
             async with httpx.AsyncClient(timeout=300.0) as client:
                 async with client.stream(
@@ -118,11 +149,34 @@ async def _handle_streaming_request(
                 ) as response:
                     response.raise_for_status()
 
-                    # 透傳 SSE 事件
                     async for chunk in response.aiter_bytes():
+                        chunk_str = chunk.decode("utf-8", errors="ignore")
+                        buffer += chunk_str
+
+                        # 從 buffer 中提取完整的 SSE 事件（以 \n\n 分隔）
+                        while "\n\n" in buffer:
+                            event, buffer = buffer.split("\n\n", 1)
+                            chunk_usage = _extract_usage_from_sse(event)
+                            if chunk_usage.total_tokens > 0:
+                                usage = chunk_usage
+
                         yield chunk
-            # Streaming 完成後記錄統計
-            stats_manager.record_request(model, message_count, input_chars, is_streaming=True)
+
+                    # 處理 buffer 中剩餘的資料
+                    if buffer.strip():
+                        chunk_usage = _extract_usage_from_sse(buffer)
+                        if chunk_usage.total_tokens > 0:
+                            usage = chunk_usage
+
+            # Streaming 完成後記錄統計與 log
+            stats_manager.record_request(model, message_count, is_streaming=True, usage=usage)
+            logger.info(
+                f"Token 使用 - 模型: {model}, "
+                f"輸入: {usage.prompt_tokens}, "
+                f"輸出: {usage.completion_tokens}, "
+                f"緩存: {usage.cached_tokens}, "
+                f"總計: {usage.total_tokens}"
+            )
         except Exception:
             # 發生錯誤時不記錄統計
             raise
@@ -144,7 +198,6 @@ async def _handle_normal_request(
     headers: dict[str, str],
     model: str,
     message_count: int,
-    input_chars: int,
 ) -> Response:
     """處理非 streaming 請求，直接回傳 JSON"""
 
@@ -156,8 +209,19 @@ async def _handle_normal_request(
         )
         response.raise_for_status()
 
-    # 記錄統計
-    stats_manager.record_request(model, message_count, input_chars, is_streaming=False)
+    # 解析回應以提取 token 使用資訊
+    response_json = response.json()
+    usage = _extract_usage_metadata(response_json)
+
+    # 記錄統計與 log
+    stats_manager.record_request(model, message_count, is_streaming=False, usage=usage)
+    logger.info(
+        f"Token 使用 - 模型: {model}, "
+        f"輸入: {usage.prompt_tokens}, "
+        f"輸出: {usage.completion_tokens}, "
+        f"緩存: {usage.cached_tokens}, "
+        f"總計: {usage.total_tokens}"
+    )
 
     return Response(
         content=response.content,
@@ -168,17 +232,22 @@ async def _handle_normal_request(
 
 def main() -> None:
     """啟動服務"""
-    import uvicorn
 
     logger.info(f"啟動 GenaiWrapper 服務在 http://{settings.host}:{settings.port}")
     logger.info(f"目標 URL: {TARGET_URL}")
 
-    uvicorn.run(
-        "genaiwrapper.main:app",
-        host=settings.host,
-        port=settings.port,
-        log_level="info",
-    )
+    try:
+        uvicorn.run(
+            app,
+            host=settings.host,
+            port=settings.port,
+            log_level="info",
+        )
+    except KeyboardInterrupt:
+        logger.info("Server Stopping by KeyboardInterrupt")
+    except Exception as e:
+        logger.error(f"Error occurred when starting Server: {e}")
+    logger.info("Server Stopped")
 
 
 if __name__ == "__main__":
