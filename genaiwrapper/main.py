@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 
 from genaiwrapper.auth import token_provider
 from genaiwrapper.config import settings
+from genaiwrapper.models import ModelInfo, get_model_list
 from genaiwrapper.stats import UsageInfo, stats_manager
 
 # 設定日誌
@@ -82,6 +83,12 @@ async def root() -> dict[str, str]:
         "service": "GenaiWrapper",
         "target": TARGET_URL,
     }
+
+
+@app.get("/v1/models")
+async def list_models() -> dict[str, list[ModelInfo]]:
+    """列出所有支援的模型"""
+    return {"data": get_model_list()}
 
 
 @app.post("/v1/chat/completions")
