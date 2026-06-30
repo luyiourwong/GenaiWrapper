@@ -1,26 +1,10 @@
-"""模型定義模組，手動維護支援的模型列表與價格資訊"""
+"""Vertex AI 模型定義"""
 
-from pydantic import BaseModel
+from genaiwrapper.models.base import ModelInfo, ModelPricing
 
-
-class ModelPricing(BaseModel):
-    """模型價格資訊 (單位: USD per 1M tokens)"""
-
-    input: float
-    cached_input: float
-    output: float
-
-
-class ModelInfo(BaseModel):
-    """模型資訊"""
-
-    id: str
-    pricing: ModelPricing
-
-
-# 手動維護的模型列表
+# Vertex AI 支援的第三方模型列表
 # 價格單位: USD per 1M tokens
-SUPPORTED_MODELS: dict[str, ModelInfo] = {
+VERTEX_MODELS: dict[str, ModelInfo] = {
     "google/gemini-3.1-pro-preview": ModelInfo(
         id="google/gemini-3.1-pro-preview",
         pricing=ModelPricing(
@@ -96,17 +80,17 @@ SUPPORTED_MODELS: dict[str, ModelInfo] = {
     "xai/grok-4.1-fast-reasoning": ModelInfo(
         id="xai/grok-4.1-fast-reasoning",
         pricing=ModelPricing(
-            input=0,
-            cached_input=0,
-            output=0,
+            input=0.2,
+            cached_input=0.05,
+            output=0.5,
         ),
     ),
     "xai/grok-4.1-fast-non-reasoning": ModelInfo(
         id="xai/grok-4.1-fast-non-reasoning",
         pricing=ModelPricing(
-            input=0,
-            cached_input=0,
-            output=0,
+            input=0.2,
+            cached_input=0.05,
+            output=0.5,
         ),
     ),
     "moonshotai/kimi-k2-thinking-maas": ModelInfo(
@@ -152,11 +136,11 @@ SUPPORTED_MODELS: dict[str, ModelInfo] = {
 }
 
 
-def get_model_list() -> list[ModelInfo]:
-    """取得所有支援的模型列表"""
-    return list(SUPPORTED_MODELS.values())
+def get_vertex_model_list() -> list[ModelInfo]:
+    """取得 Vertex AI 支援的模型列表"""
+    return list(VERTEX_MODELS.values())
 
 
-def get_model_by_id(model_id: str) -> ModelInfo | None:
-    """根據 ID 取得模型資訊"""
-    return SUPPORTED_MODELS.get(model_id)
+def get_vertex_model_by_id(model_id: str) -> ModelInfo | None:
+    """根據 ID 取得 Vertex AI 模型資訊"""
+    return VERTEX_MODELS.get(model_id)

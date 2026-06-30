@@ -5,10 +5,9 @@ import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Optional
 
 from pydantic import BaseModel
-
-from genaiwrapper.models import get_model_by_id
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +19,14 @@ class UsageInfo(BaseModel):
     completion_tokens: int = 0
     cached_tokens: int = 0
     total_tokens: int = 0
+
+
+class PricingInfo(BaseModel):
+    """價格資訊 (單位: USD per 1M tokens)"""
+
+    input: float
+    cached_input: float
+    output: float
 
 
 @dataclass
@@ -132,17 +139,16 @@ class StatsManager:
         message_count: int,
         is_streaming: bool,
         usage: UsageInfo,
+        pricing: Optional[PricingInfo] = None,
     ) -> None:
         """記錄一次請求"""
         with self._lock:
             # 計算價格
-            model_info = get_model_by_id(model)
             input_cost = 0.0
             cached_cost = 0.0
             output_cost = 0.0
 
-            if model_info:
-                pricing = model_info.pricing
+            if pricing:
                 # 輸入成本 = (總輸入 - 緩存) * 輸入價格 / 1M
                 non_cached_tokens = usage.prompt_tokens - usage.cached_tokens
                 input_cost = non_cached_tokens * pricing.input / 1_000_000
