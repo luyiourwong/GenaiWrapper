@@ -154,6 +154,13 @@ async def _handle_streaming_request(
                     json=body,
                     headers=headers,
                 ) as response:
+                    if response.status_code >= 400:
+                        error_body = await response.aread()
+                        logger.error(
+                            f"上游回應錯誤 {response.status_code}\n"
+                            f"請求 body: {json.dumps(body, ensure_ascii=False)}\n"
+                            f"回應內容: {error_body.decode('utf-8', errors='ignore')}"
+                        )
                     response.raise_for_status()
 
                     async for chunk in response.aiter_bytes():
@@ -184,6 +191,16 @@ async def _handle_streaming_request(
                 f"緩存: {usage.cached_tokens}, "
                 f"總計: {usage.total_tokens}"
             )
+        except httpx.HTTPStatusError as e:
+            logger.error(f"上游錯誤，中止串流: {e}")
+            error_payload = {
+                "error": {
+                    "message": "上游服務回應錯誤，請查看伺服器日誌",
+                    "type": "upstream_error",
+                }
+            }
+            yield f"data: {json.dumps(error_payload)}\n\n".encode("utf-8")
+            yield b"data: [DONE]\n\n"
         except Exception:
             # 發生錯誤時不記錄統計
             raise
@@ -214,6 +231,12 @@ async def _handle_normal_request(
             json=body,
             headers=headers,
         )
+        if response.status_code >= 400:
+            logger.error(
+                f"上游回應錯誤 {response.status_code}\n"
+                f"請求 body: {json.dumps(body, ensure_ascii=False)}\n"
+                f"回應內容: {response.text}"
+            )
         response.raise_for_status()
 
     # 解析回應以提取 token 使用資訊
