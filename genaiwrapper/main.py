@@ -106,6 +106,10 @@ async def chat_completions(request: Request) -> Response:
         messages = body.get("messages", [])
         logger.info(f"呼叫模型: {model}, 訊息數: {len(messages)}")
 
+        # 移除 max_tokens 相關欄位，交由上游 API 自行決定輸出長度上限，
+        # 避免因 input + max_tokens 超過模型上下文長度而被拒絕
+        body.pop("max_tokens", None)
+
         # 判斷是否為 streaming 請求
         stream = body.get("stream", False)
 
