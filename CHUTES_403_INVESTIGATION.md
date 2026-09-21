@@ -1,20 +1,29 @@
-# Chutes `llm.chutes.ai` 403 調查報告
+# `llm.chutes.ai` 403 調查報告
 
 > 調查日期：2026-09-21
 > 症狀：Cherry Studio（Electron/Chromium）連 `https://llm.chutes.ai/v1/chat/completions` 固定 403，但同一顆 API key 用 curl 正常。
+> 後續更正：本報告早期曾誤判為「防毒 SSL 攔截」，最終結論是 **HTTP/2 指紋**，詳見第 6 節與第 10 節。
 
 ---
 
 ## 1. 結論（TL;DR）
 
-**根因：本機防毒（ESET / Kaspersky）的 SSL/TLS 攔截（MITM）。**
+**根因：`llm.chutes.ai` 前面的 Google 邊緣（Google Front End / Cloud Armor）會對「特定的 HTTP/2 連線指紋」回傳 403。**
 
-Cherry Studio（Chromium/Electron）直連時，HTTPS 被防毒接管，改由**防毒自己的 TLS 堆疊**去連 `llm.chutes.ai`；chutes 前面的 **Google Front End / Cloud Armor 會擋這種非瀏覽器/非一般 client 的 TLS 連線**，回傳 `403` 與 `via: 1.1 google`。
+- **強制 HTTP/1.1 → 一律 200**（20/20 種指紋全部通過，含 Cherry Studio）。
+- Cherry Studio（Chromium/Electron）走 h2 → 403。
+- tunnel proxy（保留 Chromium 的 h2）→ 403。
+- MITM proxy（由 httpx 以 HTTP/1.1 重新發起）→ 200。
 
-未經攔截的路徑（curl / Node / Python）以及「走 loopback proxy」都正常，因此只有「Chromium 類 App、且只對 chutes」會中。
+**與 Bearer key 格式無關**（request 內容逐 byte 相同），也不是速率限制（三次重跑失敗集合完全一致）。
 
-- 403 **不是** Chutes API 的驗證錯誤（那會是 401 JSON），而是 **Google 邊緣層的 HTML 403**。
-- **與 Bearer key 格式無關**（request 內容與正常請求逐 byte 相同）。
+**解法**
+
+| 對象 | 做法 | 狀態 |
+|---|---|---|
+| Cherry Studio | 啟動參數加 `--disable-http2` | ✅ 實測有效 |
+| 任何 client | 用會以 HTTP/1.1 重新發起的 MITM relay | ✅ 實測有效 |
+| chutes 端 | 檢查 Cloud Armor 的 HTTP/2 指紋規則 | 建議（根本解） |
 
 ---
 
@@ -23,26 +32,27 @@ Cherry Studio（Chromium/Electron）直連時，HTTPS 被防毒接管，改由**
 | 項目 | 值 |
 |---|---|
 | OS | Windows 11 Pro |
-| Client A（有問題） | Cherry Studio 2.0.14（Electron / Chromium） |
-| Client B（對照） | curl 8.7.1 (Schannel，無 HTTP/2)、Node 22 (undici / `node:http2`)、Python 3.12、curl_cffi (BoringSSL) |
+| 有問題的 client | Cherry Studio 2.0.14（Electron / Chromium） |
+| 對照 client | curl 8.7.1 (Schannel，無 HTTP/2)、Node 22 (undici h1 / `node:http2`)、Python httpx、curl_cffi 0.16.3 (BoringSSL，可選 h1/h2) |
 | Endpoint | `https://llm.chutes.ai/v1/chat/completions` |
 | 上游解析 | `llm.chutes.ai` → `34.111.142.178`（無 AAAA、無 HTTPS RR） |
-| 防毒 | ESET（`ESET SSL Filter CA` 在根憑證區，SSL/TLS 掃描開啟）；另一台 Kaspersky「全開」也重現 |
 | 重現範圍 | 兩台機器、兩個不同地點皆重現 |
 
 ---
 
 ## 3. 症狀
 
-同一顆 API key：
+同一顆 API key、同一份 body：
 
-| 客戶端 | 路徑 | 結果 |
-|---|---|---|
-| Cherry Studio | 直連 | **403** |
-| curl / Node / Python / curl_cffi | 直連 | 200 |
-| Cherry Studio | 走 loopback HTTP proxy（CONNECT tunnel） | 200 |
+| 路徑 | 誰送 TLS/h2 到 chutes | HTTP 版本 | 結果 |
+|---|---|---|---|
+| Cherry Studio 直連 | Chromium/Electron | **h2** | **403** |
+| Cherry Studio 走 tunnel proxy | Chromium/Electron（原封不動） | **h2** | **403** |
+| Cherry Studio 走 MITM proxy | 我們的 proxy（httpx） | **h1** | **200** |
+| curl / Node h1 / httpx | 各自 | h1 | 200 |
+| Node `http2` / curl_cffi 部分版本 | 各自 | h2 | 200 或 403（見第 4 節） |
 
-### 403 回應（來自 Google 邊緣）
+### 403 回應（來自 Google 邊緣，非 Chutes API 錯誤）
 
 ```
 HTTP/1.1 403
@@ -56,241 +66,224 @@ via: 1.1 google
 <!doctype html><meta charset="utf-8"><meta name=viewport content="width=device-width, initial-scale=1"><title>403</title>403 Forbidden
 ```
 
-### 正常 200 回應（同端點，對照）
+### 正常 200 回應（對照）
 
 ```
 server: nginx
-x-chutes-invocationid: 360a9f0d-...
-x-chutes-quota-total: 0
-x-chutes-quota-used: 0
-x-chutes-quota-remaining: 0
+x-chutes-invocationid: ...
 x-chutes-rl-user: 60
 via: 1.1 google
 alt-svc: clear
 ```
 
-> 注意：`alt-svc: clear` 在正常 200 也會出現，因此它**不是** 403 專屬的線索（一度被誤判為 HTTP/3 線索）。
+> `alt-svc: clear` 在 200 也會出現，**不是** 403 專屬線索（一度被誤判為 HTTP/3 線索）。
 
 ---
 
-## 4. Cherry Studio 實際送出的請求（以 `echo_auth.py` / `mitm_proxy.py` 攔截）
+## 4. 決定性證據
 
-### Headers
+### 4.1 指紋矩陣：h2 vs h1（`chutes_fingerprints.py`）
+
+固定同一份 key/header/body，只換 TLS/HTTP 指紋：
+
+| impersonate | h2 (預設) | **強制 h1 (`--http1`)** |
+|---|---|---|
+| chrome99 / 104 / 110 / 116 / 120 | 200 | 200 |
+| chrome124 | 200 | 200 |
+| chrome131 | 200 | 200 |
+| **chrome133a** | **403** | **200** |
+| **chrome136** | **403** | **200** |
+| **chrome142** | **403** | **200** |
+| **chrome145** | **403** | **200** |
+| **chrome146** | **403** | **200** |
+| chrome150 / chrome(latest) | 200 | 200 |
+| edge99 / edge101 | 200 | 200 |
+| firefox133 / firefox147 | 200 | 200 |
+| **safari17_0** | **403** | **200** |
+| safari18_0 | 200 | 200 |
+
+**強制 HTTP/1.1 後 20/20 全部 200** → 與 TLS 指紋無關，問題在 **HTTP/2**。
+
+### 4.2 確定性（非速率限制）
+
+- `--repeat 3`：三輪失敗集合**完全相同**（chrome133a、chrome136、chrome142、chrome145、chrome146、safari17_0）。
+- `--delay 3`：失敗集合**不變** → 不是 rate limit。
+
+### 4.3 不是單純的 JA3
+
+- `safari17_0`（403）與 `safari18_0`（200）**濾掉 GREASE 後的 JA3 完全相同**（`5a527c775ff4ae29b4f0c77b113f9625`）。
+- 暴力掃描所有可從 ClientHello 取得的特徵（extension 集合/順序、signature_algorithms、supported_groups、key_share、cipher suites、supported_versions、長度、session_id 長度…），**沒有任何單一特徵**能分開 403 與 200。
+- → 是**複合指紋**，而 `--http1` 的結果指出關鍵在 **HTTP/2 層**（SETTINGS / WINDOW_UPDATE / priority / pseudo-header 順序等）。
+
+### 4.4 Cherry Studio 的 ClientHello 是原始 Chromium（未被防毒改寫）
+
+從 `pktmon` 擷取 Cherry Studio 直連時送往 `34.111.142.178` 的 ClientHello：
 
 ```
-host: 'llm.chutes.ai'
-connection: 'keep-alive'
-content-length: '155'
-accept-encoding: 'gzip, deflate, br, zstd'
-accept-language: 'zh-TW'
-sec-fetch-dest: 'empty'
-sec-fetch-mode: 'no-cors'
-sec-fetch-site: 'none'
-user-agent: 'ai/6.0.185 ai-sdk/provider-utils/4.0.50 runtime/node.js/24'
-authorization: 'Bearer cpk_...'
-content-type: 'application/json'
+SNI=llm.chutes.ai  len=1723  ALPN=['h2','http/1.1']  JA3=931d4f5d4917deb2ba08e3979b91dc36
+ext : fafa ff01 0 17 2d 1b 44cd b 23 d 2b fe0d 10 33 12 5 a 1a1a
+curve: eaea 11ec(X25519MLKEM768) 1d 17 18
 ```
 
-### Body（model check，非串流）
-
-```json
-{
-  "model": "deepseek-ai/DeepSeek-V4-Flash-0731-TEE",
-  "reasoning_effort": "none",
-  "messages": [
-    { "role": "system", "content": "test" },
-    { "role": "user", "content": "hi" }
-  ]
-}
-```
-
-### Body（實際對話，串流）
-
-```json
-{
-  "model": "Qwen/Qwen3.8-27B-TEE",
-  "messages": ["..."],
-  "stream": true,
-  "stream_options": { "include_usage": true }
-}
-```
-
-### Authorization header 結構分析
-
-`Bearer cpk_<32 hex>.<32 hex>.<32 char base64url>`（token 長度 102，共三段 `[36, 32, 32]`）
-
-- 無多餘空白、無控制字元、無非 ASCII、無引號、無重複 header
-- **結構完全正常**，與 curl 使用的 key 相同
+屬現代 Chrome 的正常指紋（GREASE、ECH GREASE `0xfe0d`、delegated credentials `0x44cd`、post-quantum `0x11ec`），**沒有被 ESET 改寫**。
 
 ---
 
-## 5. 測試紀錄與結果
+## 5. 排除清單
 
-| # | 測試 | 目的 | 結果 |
-|---|---|---|---|
-| 1 | `echo_auth.py` 攔截 Cherry Studio header/body | 檢查 key 格式與 header | 一切正常，無 anomaly |
-| 2 | curl 預設 + Cherry Studio 完整 header | 排除 header / UA | **200** |
-| 3 | Node fetch（HTTP/1.1） | 排除 HTTP/1.1 | **200** |
-| 4 | Node `http2` | 排除 HTTP/2 | **200** |
-| 5 | Node h2 + Cherry Studio 完整 header（含 `sec-fetch-*`、無 `Accept`） | 排除「h2 指紋 + 瀏覽器特徵」組合 | **200** |
-| 6 | curl `-4`（IPv4） | IPv4 連線 | **200** |
-| 7 | curl `-6`（IPv6） | IPv6 連線 | 連線失敗（該機無 IPv6 路由；也無 AAAA） |
-| 8 | curl_cffi 模擬 `chrome` / `chrome124` / `chrome110` / `safari` / `firefox`（BoringSSL） | 排除 TLS 指紋 (JA3/JA4) | **全部 200** |
-| 9 | curl_cffi `chrome` + Cherry Studio 的 Node UA | 排除「指紋與 UA 不匹配」 | **200** |
-| 10 | 以管理員封鎖 outbound UDP/443（規則 Enabled=True 已驗證）後直連 | 排除 HTTP/3 (QUIC) | 仍 **403** |
-| 11 | 刪除 Chromium `Network Persistent State`（清 alt-svc 快取）後直連 | 排除 alt-svc 快取 | 仍 **403** |
-| 12 | `Resolve-DnsName` A / AAAA / HTTPS(65) | DNS / ECH / h3 廣告 | A=`34.111.142.178`；**無 AAAA**；**無 HTTPS RR** |
-| 13 | `curl https://dns.google/resolve?...&type=HTTPS` | 確認無 HTTPS RR（無 alpn/ech） | 無 Answer |
-| 14 | 系統 DNS vs Google DoH | DNS 一致性 | 皆 `34.111.142.178` |
-| 15 | `Get-NetTCPConnection` 監看 Cherry Studio 直連 | 是否連錯節點 | 連到 **`34.111.142.178`（正確）** |
-| 16 | 讀取系統 Proxy 設定 | 排除系統 proxy / WPAD | `ProxyEnable=0`、無 `AutoConfigURL` |
-| 17 | `mitm_proxy.py`（MITM 模式）攔截 | 取得完整請求 | 與 echo 一致；**轉發後 200** |
-| 18 | `mitm_proxy.py --tunnel`（純 TCP 轉發，Chromium 的 TLS/h2 原封不動） | 分離「連線路徑」 vs 「Chromium TLS/h2」 | **200** |
-| 19 | Python 直連看憑證 issuer | 是否被防毒攔截 | `Go Daddy Secure Certificate Authority - G2`（**真憑證，未被攔截**） |
-| 20 | Edge 直連看憑證 issuer | Chromium 類是否被攔截 | `ESET SSL Filter CA`（**被攔截**） |
-| 21 | 根憑證區查詢 | 防毒攔截是否啟用 | `ESET SSL Filter CA` 存在 |
-
----
-
-## 6. 逐一排除的因素
-
-| 因素 | 排除理由 |
+| 假設 | 排除理由 |
 |---|---|
-| Bearer key 格式 / 內容 | MITM 攔到的 header 與 body 和正常 curl 請求完全相同 |
-| 所有 header（含 `sec-fetch-*`、缺 `Accept`） | 全套照抄給 curl / Node 皆 200 |
-| User-Agent 被 WAF 擋 | 用 Cherry Studio 的 Node UA 測也 200 |
-| HTTP/1.1 vs HTTP/2 | 兩者皆 200 |
-| TLS 指紋 (JA3/JA4) | curl_cffi 以 BoringSSL 模擬 chrome / safari / firefox 皆 200 |
-| HTTP/3 (QUIC) | 管理員確實封鎖 UDP/443 後直連仍 403；且無 HTTPS RR |
-| ECH | `llm.chutes.ai` 沒有 HTTPS RR（無 ECHConfig） |
-| 連錯節點 / DNS | 系統與 DoH 皆 `34.111.142.178`，且實測 Cherry Studio 直連就是該 IP |
+| Bearer key 格式 / 內容 | MITM 攔到的 header 與 body 和可通的 curl 請求完全相同 |
+| 所有 header（含 `sec-fetch-*`、缺 `Accept`） / User-Agent | 全套照抄給 curl / Node(h1,h2) 皆 200 |
+| HTTP/1.1 vs HTTP/2（作為「TLS 差異」） | 見第 4 節；問題確定在 h2 層 |
+| TLS 指紋 (JA3/JA4) | 濾掉 GREASE 後 JA3 相同的兩者結果不同；強制 h1 後連「被擋的版本」都 200 |
+| HTTP/3 (QUIC) | 以管理員封鎖 outbound UDP/443（規則 Enabled=True 已驗證）後直連仍 403；且無 HTTPS RR |
+| ECH | `llm.chutes.ai` 無 HTTPS RR（DNS type 65 無 Answer） |
+| DNS / 連錯節點 | 系統 DNS 與 DoH 皆 `34.111.142.178`；`Get-NetTCPConnection` 證實直連就是該 IP |
 | 系統 Proxy / WPAD | `ProxyEnable=0`、無 `AutoConfigURL` |
-| IPv6 | 無 AAAA，該機也無 IPv6 路由 |
-| Chromium 的 TLS/h2 本身 | 純 TCP tunnel（不終結 TLS）下，Chromium 自己完成 TLS/h2 仍 200 |
-| alt-svc 快取 | 刪除 `Network Persistent State` 後仍 403 |
-
-**剩下的唯一變因：防毒 SSL/TLS 攔截。**
-
----
-
-## 7. 根因推論鏈
-
-1. Cherry Studio（Chromium/Electron）直連 `llm.chutes.ai` 時，**HTTPS 被 ESET 攔截**（Edge 顯示 `ESET SSL Filter CA`；Python/curl/Node 顯示真憑證 `GoDaddy`，代表只有 Chromium 類被攔）。
-2. 防毒以**自己的 TLS 堆疊**重新與 chutes 建立連線。
-3. chutes 前面的 **Google Front End / Cloud Armor** 對這種 TLS/指紋連線回 **403**（`via: 1.1 google` + 通用 HTML）。
-4. 走 loopback proxy 時，Chromium 的 TLS 是連到 `127.0.0.1`，**防毒會跳過 loopback** → 未攔截 → Chromium 自己的 TLS 直達 → 200。
-5. 其他 API 沒有這種邊緣過濾，所以防毒攔截對它們無感 → 這就是「為什麼只有 chutes 有事」。
+| IPv6 | 無 AAAA；該機無 IPv6 路由 |
+| 速率限制 | `--repeat 3` 失敗集合一致、`--delay 3` 無效 |
+| alt-svc 快取 | 刪除 Chromium `Network Persistent State` 後仍 403 |
+| **防毒 SSL 攔截（ESET/Kaspersky）** | Edge 確實被 MITM（憑證 issuer = `ESET SSL Filter CA`），但 **Cherry Studio 沒有**：實測其 ClientHello 為原始 Chromium（第 4.4 節）。此為早期誤判，已排除 |
 
 ---
 
-## 8. Issue 草稿（可提交；建議開在 Chutes 端）
+## 6. 根因
+
+`llm.chutes.ai` 由 Google Front End 提供，前面掛 Cloud Armor。該邊緣層對**特定 HTTP/2 連線指紋**回傳 403（Google 的通用 HTML 403 頁），但對 HTTP/1.1 一律放行。
+
+- 觸發條件在 **HTTP/2 層**（可能是 SETTINGS（含 GREASE settings）、WINDOW_UPDATE、priority frames、pseudo-header 順序，或 TLS+h2 的複合簽章）。
+- Cherry Studio（Electron/Chromium）的 h2 指紋正好落在被擋的集合內。
+- 其他 API 前端沒有這種規則，因此只有 chutes 會中 —— 這也是「為什麼只有 chutes 有事」的答案。
+
+---
+
+## 7. 解法
+
+### 7.1 Cherry Studio：停用 HTTP/2（已實測有效）
+
+在 Cherry Studio 捷徑的「目標」後面加上：
+
+```
+--disable-http2
+```
+
+例：
+```
+"C:\Users\<你>\AppData\Local\Programs\Cherry Studio\Cherry Studio.exe" --disable-http2
+```
+
+### 7.2 通用：以 HTTP/1.1 重新發起的 MITM relay（已實測有效）
+
+因為必须是「由另一個 stack 用 h1 重新發起」，**tunnel proxy 無效**（保留 h2），要用 **MITM 模式**：
+
+```powershell
+.venv\Scripts\python.exe mitm_proxy.py     # 不是 --tunnel
+# Cherry Studio proxy = 自訂 http://127.0.0.1:8888
+```
+
+### 7.3 根本解：chutes 端調整
+
+請 chutes 檢查 Cloud Armor 是否對 HTTP/2 指紋（含 GREASE settings / priority）設定過嚴規則，導致正牌瀏覽器/Electron 被擋。
+
+---
+
+## 8. 建議的回報方式
+
+### 8.1 給 Cherry Studio（建議加 FAQ，而非改程式）
+
+> **Q：某些 OpenAI 相容供應商出現 403 Forbidden（例如 llm.chutes.ai），但同樣的 key 用 curl 正常？**
+>
+> **A：** 該供應商前面的 CDN/WAF 可能對 HTTP/2 指紋有嚴格規則，導致 Chromium/Electron 的連線被擋。可在 Cherry Studio 執行檔後面加上 `--disable-http2` 啟動參數強制使用 HTTP/1.1（實測可解）。這是 Chromium 內建參數，不需修改程式。
+
+（若 Cherry 願意，也可在「網路」設定提供「強制 HTTP/1.1」選項。）
+
+### 8.2 給 Chutes（bug report）
 
 ```markdown
-# llm.chutes.ai returns edge 403 for Chromium clients behind antivirus SSL interception (MITM); non-intercepted clients work
+# llm.chutes.ai returns edge 403 for specific HTTP/2 fingerprints; HTTP/1.1 always works
 
-## Environment
-- OS: Windows 11 Pro
-- Client A: Cherry Studio 2.0.14 (Electron/Chromium)
-- Client B (control): curl 8.7.1 (Schannel), Node 22 (undici / node:http2), Python, curl_cffi (BoringSSL)
-- Endpoint: https://llm.chutes.ai/v1/chat/completions
-- Network: two different machines/locations, both reproduce
-- Antivirus: ESET (ESET SSL Filter CA present, SSL/TLS scanning ON); a Kaspersky machine with all protection ON also reproduces
-- Upstream: llm.chutes.ai -> 34.111.142.178 (no AAAA, no HTTPS RR)
+## Summary
+Requests to https://llm.chutes.ai/v1/chat/completions from Chromium/Electron clients
+(and some browser fingerprints) are rejected with an HTTP/2-level 403 from the Google edge.
+Forcing HTTP/1.1 makes every request succeed (20/20 fingerprints).
 
-## Actual
-Same API key:
-- Cherry Studio (direct)            -> 403
-- curl / Node / Python / curl_cffi  -> 200
-- Cherry Studio via local HTTP proxy (CONNECT tunnel over loopback) -> 200
+## Evidence
+- Same API key / headers / body:
+  - Cherry Studio 2.0.14 (Electron, HTTP/2) -> 403
+  - same request relayed over HTTP/1.1      -> 200
+  - curl / Node(http1) / httpx              -> 200
+- Fingerprint matrix (curl_cffi impersonation, HTTP/2):
+  403: chrome133a, chrome136, chrome142, chrome145, chrome146, safari17_0
+  200: chrome99/104/110/116/120/124/131/150/latest, edge99/101, firefox133/147, safari18_0
+- The same matrix with HTTP/1.1 forced -> **all 200**.
+- Deterministic: three consecutive runs and a 3s-per-request run produced the identical 403 set
+  (not rate limiting).
+- Not a simple JA3 rule: safari17_0 (403) and safari18_0 (200) have the identical GREASE-filtered JA3.
+- The 403 is the generic Google Front End page:
+  `via: 1.1 google`, `content-type: text/html; charset=UTF-8`,
+  `<!doctype html>...<title>403</title>403 Forbidden`.
 
-The 403 is a Google edge response, not a Chutes API error:
+## Ruled out
+API key, headers, body, DNS/IP, IPv4/IPv6, system proxy, HTTP/3 (UDP 443 blocked), ECH (no HTTPS RR),
+antivirus TLS interception (captured ClientHello is a genuine modern Chromium one).
 
-    content-type: text/html; charset=UTF-8
-    via: 1.1 google
-    alt-svc: clear
-    document-policy: include-js-call-stacks-in-crash-reports
-
-    <!doctype html><meta charset="utf-8">...<title>403</title>403 Forbidden
-
-## Expected
-Cherry Studio should receive the normal OpenAI-compatible response (HTTP 200 / SSE), as it does with every other OpenAI-compatible provider using the same key.
-
-## Eliminated (each returned 200)
-- Bearer key format/content: MITM capture shows the exact same Authorization header and JSON body as the working curl request
-- Headers (including sec-fetch-*, missing Accept) and User-Agent
-- HTTP/1.1 vs HTTP/2
-- TLS fingerprint: curl_cffi impersonating chrome / chrome110 / chrome124 / safari / firefox (BoringSSL) all 200
-- HTTP/3: blocking outbound UDP/443 with an enabled Windows Firewall rule (verified) still 403; and no HTTPS RR/advertised h3
-- ECH: llm.chutes.ai publishes no HTTPS RR (DNS type 65 returns no answer)
-- Wrong node / DNS: system DNS and Google DoH both return 34.111.142.178; Get-NetTCPConnection shows Cherry Studio's direct connection going to 34.111.142.178
-- System proxy / WPAD: ProxyEnable=0, no AutoConfigURL
-- IPv6: no AAAA record
-- Chromium's own TLS/h2: with a plain TCP tunnel (no TLS termination, so Chromium performs its own TLS/h2 to Chutes) the same request returns 200
-
-## Root cause (analysis)
-The only remaining variable is local antivirus SSL/TLS interception:
-- A plain Python TLS connection to llm.chutes.ai sees the real certificate (issuer: "Go Daddy Secure Certificate Authority - G2") -> Python/curl/Node are NOT intercepted
-- Microsoft Edge to llm.chutes.ai sees issuer "ESET SSL Filter CA" -> Chromium-based apps ARE intercepted and re-originated by the AV
-- Routing Cherry Studio through a loopback proxy bypasses the AV interception and returns 200
-
-=> TLS connections re-originated by the antivirus are rejected with 403 by the Google edge in front of Chutes, while non-intercepted connections succeed. Other providers do not show this, which suggests stricter TLS/fingerprint filtering at Chutes' edge.
-
-## Suggestion
-- Chutes: check whether Google Front End / Cloud Armor is rejecting TLS/HTTP connections originating from security-product MITM stacks, and/or return a distinguishable error instead of the generic Google 403 HTML.
-- Alternative: document that endpoints fronted by the Google edge may 403 enterprise SSL-inspection traffic.
-
-## Workaround
-- Route the client through a local CONNECT tunnel proxy (loopback traffic is not intercepted)
-- Or add llm.chutes.ai to the antivirus SSL/TLS exclusion list
+## Request
+Please review the Cloud Armor rule(s) that reject specific HTTP/2 fingerprints
+(possibly related to HTTP/2 SETTINGS / GREASE settings / priority / pseudo-header ordering),
+so that standard Chromium/Electron clients are not blocked.
 ```
 
-> 若要改開在 **Cherry Studio**，把最後「Suggestion」改成：
-> 建議新增「忽略系統憑證 / 繞過企業 SSL 攔截」或「自訂 TLS/憑證」選項。
-
 ---
 
-## 9. Workaround
+## 9. 附錄：本次使用的工具
 
-1. **立即**：掛著本機 CONNECT tunnel proxy（`mitm_proxy.py --tunnel`），Cherry Studio proxy 設為 `http://127.0.0.1:8888`。
-2. **根治**：請 MIS 將 `llm.chutes.ai` 加入防毒的 SSL/TLS 例外清單。
-3. **遊戲機（Kaspersky）**：網路設定 → 加密連線掃描 → 排除 `llm.chutes.ai`（或暫時關閉以驗證）。
-
----
-
-## 10. 附錄：本次使用的工具
-
-皆為獨立腳本，**未修改專案任何 tracked 檔案**。
+皆為獨立腳本，**未修改專案任何 tracked 程式碼**。
 
 | 檔案 | 用途 |
 |---|---|
-| `echo_auth.py` | 簡易 Echo 伺服器，解析並顯示傳入的 `Authorization` header 結構與異常 |
-| `chutes_bisect.py` | Header / HTTP 版本 / IPv4-6 的逐一比對（curl + Node h1/h2） |
-| `chutes_chrome.py` | 以 curl_cffi 模擬各瀏覽器 TLS 指紋 |
-| `mitm_proxy.py` | HTTPS 攔截 proxy（MITM 模式可看完整請求；`--tunnel` 為純 TCP 轉發，不需憑證） |
+| `echo_auth.py` | 簡易 Echo 伺服器，解析傳入的 `Authorization` header |
+| `chutes_bisect.py` | Header / HTTP 版本 / IPv4-6 比對（curl + Node h1/h2） |
+| `chutes_chrome.py` | 以 curl_cffi 模擬各瀏覽器指紋 |
+| `chutes_fingerprints.py` | **指紋矩陣**：`--repeat`、`--delay`、`--http1` |
+| `clienthello_versions.py` | 在本機擷取 curl_cffi 各版本的 ClientHello（比對 JA3/extension） |
+| `tls_clienthello_compare.py` | 用 pktmon 擷取並比對直連 vs tunnel 的 ClientHello（`--inspect`、`--self-test`） |
+| `mitm_proxy.py` | HTTPS proxy（MITM 模式看內容並以 h1 轉發；`--tunnel` 為純 TCP 轉發） |
 
 ### 常用指令
 
 ```powershell
-# Echo 診斷伺服器
-.venv\Scripts\python.exe echo_auth.py --port 8787
-
-# Header / 版本 / 指紋比對（需 CHUTES_API_KEY）
+# 指紋矩陣（需 CHUTES_API_KEY）
 $env:CHUTES_API_KEY="cpk_..."
-.venv\Scripts\python.exe chutes_bisect.py
-.venv\Scripts\python.exe chutes_chrome.py
+.venv\Scripts\python.exe chutes_fingerprints.py            # 預設 h2
+.venv\Scripts\python.exe chutes_fingerprints.py --http1   # 強制 h1（全部 200）
+.venv\Scripts\python.exe chutes_fingerprints.py --repeat 3# 驗證確定性
+.venv\Scripts\python.exe chutes_fingerprints.py --delay 3 # 排除速率限制
 
-# HTTPS 攔截 proxy
-.venv\Scripts\python.exe mitm_proxy.py            # MITM（需信任 CA）
-.venv\Scripts\python.exe mitm_proxy.py --tunnel   # 純 TCP 轉發
+# 本機擷取 curl_cffi 各版本 ClientHello（不需 key/管理員）
+.venv\Scripts\python.exe clienthello_versions.py
 
-# 匯入 / 移除 MITM CA
-Import-Certificate -FilePath "$env:TEMP\genaiwrapper_mitm\ca.crt" -CertStoreLocation Cert:\CurrentUser\Root
-Get-ChildItem Cert:\CurrentUser\Root | Where-Object Subject -like "*GenaiWrapper MITM CA*" | Remove-Item
+# HTTP/1.1 relay（不需憑證、不碰專案）
+.venv\Scripts\python.exe mitm_proxy.py --tunnel   # 保留 h2 -> 仍會被擋
+.venv\Scripts\python.exe mitm_proxy.py            # MITM，以 h1 轉發 -> 可通
+```
 
-# 查看憑證 issuer（判斷是否被防毒攔截）
-.venv\Scripts\python.exe -c "import ssl,socket;c=ssl.create_default_context();s=c.wrap_socket(socket.create_connection(('llm.chutes.ai',443)),server_hostname='llm.chutes.ai');print(s.getpeercert()['issuer'])"
+### 清理本次調查的暫時變更
 
-# 清理本次調查的暫時變更
+```powershell
 Remove-NetFirewallRule -DisplayName "Block QUIC"
 uv pip uninstall --python .venv\Scripts\python.exe curl_cffi
+Get-ChildItem Cert:\CurrentUser\Root | Where-Object Subject -like "*GenaiWrapper MITM CA*" | Remove-Item
+Remove-Item -Recurse -Force "$env:TEMP\genaiwrapper_mitm", "$env:TEMP\genaiwrapper_tls"
 ```
+
+---
+
+## 10. 更正說明
+
+本報告初版把根因判為「本機防毒（ESET）SSL 攔截」，**該結論錯誤**，原因如下：
+
+- Edge 的憑證 issuer 確實是 `ESET SSL Filter CA`，但那只是證明 **Edge** 被攔；
+- 以 `pktmon` 實際擷取 **Cherry Studio** 直連的 ClientHello，得到的是**原始現代 Chromium 指紋**（第 4.4 節），代表 Cherry Studio 這條連線**沒有**被防毒 MITM。
+
+後續以「同一 key、同一 body、只換 TLS/HTTP 指紋」的矩陣實驗，才定位到真正原因是 **HTTP/2 指紋**（強制 h1 後 20/20 全 200）。

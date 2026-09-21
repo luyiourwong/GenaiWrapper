@@ -263,10 +263,12 @@ async def tunnel(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tar
     """不做 MITM，直接把 TCP 通道接去上游（--tunnel 模式）"""
     host, _, port = target.partition(":")
     up_reader, up_writer = await asyncio.open_connection(host, int(port or 443))
+    counts = {"up": 0, "down": 0}
 
-    async def pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
+    async def pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter, key: str) -> None:
         try:
             while data := await src.read(65536):
+                counts[key] += len(data)
                 dst.write(data)
                 await dst.drain()
         except Exception:  # noqa: BLE001
@@ -274,7 +276,9 @@ async def tunnel(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tar
         finally:
             dst.close()
 
-    await asyncio.gather(pipe(reader, up_writer), pipe(up_reader, writer))
+    await asyncio.gather(pipe(reader, up_writer, "up"), pipe(up_reader, writer, "down"))
+    # 由 server->client 的位元組量可粗判結果：403 錯誤頁很小、串流回覆很大
+    log(f"[TUNNEL] {target}  client->server={counts['up']}  server->client={counts['down']}")
 
 
 async def handle_client(
