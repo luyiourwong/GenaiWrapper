@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "deep-wiki": {
-      "httpUrl": "https://mcp.deepwiki.com/mcp"
-    }
-  },
-  "$version": 3
-}
