@@ -13,6 +13,7 @@ from fastapi.responses import StreamingResponse
 from genaiwrapper.auth import token_provider
 from genaiwrapper.config import settings
 from genaiwrapper.models import ModelInfo, get_model_list
+from genaiwrapper.routing import DEFAULT_TARGET_URL, resolve_upstream
 from genaiwrapper.stats import UsageInfo, stats_manager
 
 # 設定日誌
@@ -71,17 +72,13 @@ app = FastAPI(
 )
 
 
-# 建立目標 URL
-TARGET_URL = f"https://{settings.endpoint}/v1/projects/{settings.project_id}/locations/{settings.region}/endpoints/openapi/chat/completions"
-
-
 @app.get("/")
 async def root() -> dict[str, str]:
     """根端點，檢查服務是否運行"""
     return {
         "status": "running",
         "service": "GenaiWrapper",
-        "target": TARGET_URL,
+        "target": DEFAULT_TARGET_URL,
     }
 
 
@@ -110,6 +107,10 @@ async def chat_completions(request: Request) -> Response:
         # 避免因 input + max_tokens 超過模型上下文長度而被拒絕
         body.pop("max_tokens", None)
 
+        # 依模型設定決定上游 URL，並將別名換成實際模型 ID
+        target = resolve_upstream(model)
+        body["model"] = target.model
+
         # 判斷是否為 streaming 請求
         stream = body.get("stream", False)
 
@@ -128,10 +129,10 @@ async def chat_completions(request: Request) -> Response:
 
         if stream:
             # Streaming 模式：透傳 SSE 回應
-            return await _handle_streaming_request(body, headers, model, len(messages))
+            return await _handle_streaming_request(target.url, body, headers, model, len(messages))
         else:
             # 非 Streaming 模式：直接回傳 JSON
-            return await _handle_normal_request(body, headers, model, len(messages))
+            return await _handle_normal_request(target.url, body, headers, model, len(messages))
 
     except Exception as e:
         logger.error(f"處理請求時發生錯誤: {e}", exc_info=True)
@@ -139,6 +140,7 @@ async def chat_completions(request: Request) -> Response:
 
 
 async def _handle_streaming_request(
+    target_url: str,
     body: dict[str, Any],
     headers: dict[str, str],
     model: str,
@@ -154,7 +156,7 @@ async def _handle_streaming_request(
             async with httpx.AsyncClient(timeout=300.0) as client:
                 async with client.stream(
                     "POST",
-                    TARGET_URL,
+                    target_url,
                     json=body,
                     headers=headers,
                 ) as response:
@@ -222,6 +224,7 @@ async def _handle_streaming_request(
 
 
 async def _handle_normal_request(
+    target_url: str,
     body: dict[str, Any],
     headers: dict[str, str],
     model: str,
@@ -231,7 +234,7 @@ async def _handle_normal_request(
 
     async with httpx.AsyncClient(timeout=300.0) as client:
         response = await client.post(
-            TARGET_URL,
+            target_url,
             json=body,
             headers=headers,
         )
@@ -268,7 +271,7 @@ def main() -> None:
     """啟動服務"""
 
     logger.info(f"啟動 GenaiWrapper 服務在 http://{settings.host}:{settings.port}")
-    logger.info(f"目標 URL: {TARGET_URL}")
+    logger.info(f"預設目標 URL: {DEFAULT_TARGET_URL}")
 
     try:
         uvicorn.run(
